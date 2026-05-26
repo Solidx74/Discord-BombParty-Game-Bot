@@ -2,273 +2,202 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
+const { Client, GatewayIntentBits } = require('discord.js');
 
+// ==========================================
+// 1. LIGHTWEIGHT KEEPER (EXPRESS)
+// ==========================================
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Enable CORS for development
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-
 const PORT = process.env.PORT || 3001;
 
-// 1. Load ~274,000 English words from word-list package into a Set for O(1) lookups
-const wordListPath = path.join(__dirname, 'node_modules', 'word-list', 'words.txt');
-const dictionarySet = new Set(
-  fs.readFileSync(wordListPath, 'utf8')
-    .split('\n')
-    .map(w => w.toLowerCase().trim())
-    .filter(Boolean)
-);
+app.get('/', (req, res) => {
+  res.send("Solid BombParty Bot is alive and listening!");
+});
 
-// Fallback / Extra words: Add words from an-array-of-english-words to the Set (~275,000 words, MIT)
+app.listen(PORT, () => {
+  console.log(`Web keeper server listening on port ${PORT}`);
+});
+
+// ==========================================
+// 2. DICTIONARY LOAD (Set for O(1) lookups)
+// ==========================================
+const wordListPath = path.join(__dirname, 'node_modules', 'word-list', 'words.txt');
+let dictionarySet = new Set();
+
+try {
+  if (fs.existsSync(wordListPath)) {
+    const rawWords = fs.readFileSync(wordListPath, 'utf8');
+    rawWords
+      .split('\n')
+      .map(w => w.toLowerCase().trim())
+      .filter(Boolean)
+      .forEach(w => dictionarySet.add(w));
+    console.log(`Main dictionary loaded: ${dictionarySet.size} words.`);
+  } else {
+    console.warn("Main 'words.txt' file not found. Falling back to internal list.");
+  }
+} catch (err) {
+  console.error("Failed to load main dictionary:", err.message);
+}
+
+// Merge fallback extra words from an-array-of-english-words
 try {
   const extraWords = require('an-array-of-english-words');
   extraWords.forEach(w => {
     if (w) dictionarySet.add(w.toLowerCase().trim());
   });
+  console.log(`Comprehensive dictionary loaded. Total unique words: ${dictionarySet.size}`);
 } catch (err) {
   console.warn("Could not load fallback 'an-array-of-english-words' package:", err.message);
 }
 
-console.log(`Dictionary loaded: ${dictionarySet.size} unique English words.`);
+// Fallback in case dictionary packages are empty
+if (dictionarySet.size === 0) {
+  const defaultWords = ["the", "and", "bomb", "party", "discord", "game", "bot", "code", "server", "active", "syllable", "timer"];
+  defaultWords.forEach(w => dictionarySet.add(w));
+  console.log("Using emergency default vocabulary list.");
+}
 
-// 2. Global Game State Object
-const gameState = {
-  currentSyllable: "",
-  turnOwner: null,
-  bombTimer: 15.0,
-  usedWords: new Set(),
-  // Players data map (socketId -> { username, lives })
-  players: new Map()
-};
+// ==========================================
+// 3. GAME STATE ENGINE
+// ==========================================
+let gameActive = false;
+let currentSyllable = "";
+let bombTimer = null;
+let gameChannelId = null;
+const usedWords = new Set();
 
-// Common BombParty syllables
-const SYLLABLES = [
-  "th", "in", "ch", "an", "er", "al", "re", "te", "it", "on", "es", "st", "de", "co", "ma", "ar", "li", "en", "at", "or"
-];
+// Hardcoded pool of syllables
+const SYLLABLES = ["TH", "IN", "AN", "RE", "ER", "TE", "AL", "ST", "CO", "MA", "LI", "DE", "OR", "IT", "ON", "ES"];
 
-// Helper to select a new valid syllable
-function pickNewSyllable() {
+// Helper to pick a random syllable
+function pickRandomSyllable() {
   const randomIndex = Math.floor(Math.random() * SYLLABLES.length);
-  gameState.currentSyllable = SYLLABLES[randomIndex];
+  currentSyllable = SYLLABLES[randomIndex];
+  return currentSyllable;
 }
 
-// Helper to get active player list with lives > 0
-function getActivePlayers() {
-  return Array.from(gameState.players.entries())
-    .filter(([_, player]) => player.lives > 0)
-    .map(([id, _]) => id);
-}
-
-// Helper to rotate turns to the next active player
-function rotateTurn() {
-  const activeIds = getActivePlayers();
-  if (activeIds.length === 0) {
-    gameState.turnOwner = null;
-    return;
-  }
-
-  if (!gameState.turnOwner || !activeIds.includes(gameState.turnOwner)) {
-    gameState.turnOwner = activeIds[0];
-    return;
-  }
-
-  const currentIndex = activeIds.indexOf(gameState.turnOwner);
-  const nextIndex = (currentIndex + 1) % activeIds.length;
-  gameState.turnOwner = activeIds[nextIndex];
-}
-
-// Helper to format map to object for lightweight socket state updates
-function getSerializableGameState() {
-  const playersObj = {};
-  gameState.players.forEach((value, key) => {
-    playersObj[key] = value;
-  });
-  return {
-    currentSyllable: gameState.currentSyllable,
-    turnOwner: gameState.turnOwner,
-    bombTimer: gameState.bombTimer,
-    usedWords: Array.from(gameState.usedWords),
-    players: playersObj
-  };
-}
-
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+// ==========================================
+// 4. TRADITIONAL DISCORD ENGINE
+// ==========================================
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ]
 });
 
-// Pick the initial syllable
-pickNewSyllable();
+// Function to handle game over / explosion
+function explodeBomb(channel) {
+  if (!gameActive) return;
+  
+  channel.send("💥 **BOOM!** The bomb exploded! Nobody answered in time. Game Over! Type `!start` to play again.");
+  
+  // Reset game state
+  gameActive = false;
+  gameChannelId = null;
+  usedWords.clear();
+  if (bombTimer) {
+    clearTimeout(bombTimer);
+    bombTimer = null;
+  }
+}
 
-// 3. Async Game Tick Loop via setInterval running every 100ms
-setInterval(() => {
-  const activeIds = getActivePlayers();
-  if (activeIds.length === 0) {
-    return; // No active players to run the game for
+// Function to start or reset the 15-second round timer
+function startRoundTimer(channel) {
+  if (bombTimer) {
+    clearTimeout(bombTimer);
+  }
+  
+  bombTimer = setTimeout(() => {
+    explodeBomb(channel);
+  }, 15000); // 15 seconds
+}
+
+client.once('ready', () => {
+  console.log(`Logged in to Discord as ${client.user.tag}! Standalone Text Bot is ready.`);
+});
+
+client.on('messageCreate', async (message) => {
+  // Ignore bot messages
+  if (message.author.bot) return;
+
+  const content = message.content.trim();
+
+  // Command: !start
+  if (content.toLowerCase() === '!start') {
+    if (gameActive) {
+      message.reply("⚠️ A BombParty game is already active in this server! Solve the prompt or wait for it to explode.");
+      return;
+    }
+
+    gameActive = true;
+    gameChannelId = message.channel.id;
+    usedWords.clear();
+    const prompt = pickRandomSyllable();
+
+    await message.channel.send(
+      `💣 **BombParty Started!**\n` +
+      `Find a valid English word containing **"${prompt}"**!\n` +
+      `⏱️ You have **15 seconds** before the bomb explodes! Type your guess in this channel!`
+    );
+
+    startRoundTimer(message.channel);
+    return;
   }
 
-  // Only decrement timer if there is a valid turn owner
-  if (gameState.turnOwner) {
-    gameState.bombTimer = Math.max(0, parseFloat((gameState.bombTimer - 0.1).toFixed(1)));
+  // Handle active game inputs
+  if (gameActive && message.channel.id === gameChannelId) {
+    const cleanedWord = content.toLowerCase().trim();
 
-    // Emit lightweight tick event with only the floating-point bombTimer
-    io.emit('TIMER_TICK', { bombTimer: gameState.bombTimer });
-
-    // Handle bomb explosion when timer hits zero
-    if (gameState.bombTimer <= 0) {
-      const activePlayer = gameState.players.get(gameState.turnOwner);
-      if (activePlayer) {
-        activePlayer.lives = Math.max(0, activePlayer.lives - 1);
-      }
-
-      // Reset timer, pick new syllable, rotate turn, reset used words for the new round, and send full STATE_UPDATE
-      gameState.bombTimer = 15.0;
-      gameState.usedWords.clear();
-      pickNewSyllable();
-      rotateTurn();
-      io.emit('STATE_UPDATE', getSerializableGameState());
-    }
-  } else {
-    // If turn owner is null or disconnected but we have active players, start the turn
-    rotateTurn();
-    io.emit('STATE_UPDATE', getSerializableGameState());
-  }
-}, 100);
-
-// Socket IO Event Listeners
-io.on('connection', (socket) => {
-  console.log(`Socket connected: ${socket.id}`);
-
-  // Handle player joining
-  socket.on('JOIN_GAME', ({ username }) => {
-    const defaultLives = 3;
-    gameState.players.set(socket.id, {
-      username: username || `Player_${socket.id.substring(0, 4)}`,
-      lives: defaultLives
-    });
-
-    // If there is no active turn owner, assign to this player
-    if (!gameState.turnOwner) {
-      rotateTurn();
+    // Check 1: Must contain the active syllable
+    if (!cleanedWord.includes(currentSyllable.toLowerCase())) {
+      return; // Silently ignore words that do not even match the syllable criteria
     }
 
-    io.emit('STATE_UPDATE', getSerializableGameState());
-  });
-
-  // Handle custom manual word submissions
-  socket.on('SUBMIT_WORD', ({ word }) => {
-    // Defensive validation gateway
-    if (socket.id !== gameState.turnOwner) {
-      socket.emit('VALIDATION_ERROR', { message: "It is not your turn!" });
-      return;
-    }
-
-    if (!word || typeof word !== 'string') {
-      socket.emit('VALIDATION_ERROR', { message: "Invalid word submitted." });
-      return;
-    }
-
-    const cleanedWord = word.toLowerCase().trim();
-
-    // 1. Confirm word contains the current syllable
-    if (!cleanedWord.includes(gameState.currentSyllable.toLowerCase())) {
-      socket.emit('VALIDATION_ERROR', { message: `Word must contain the syllable "${gameState.currentSyllable}"!` });
-      return;
-    }
-
-    // 2. Ensure it is absent from usedWords (O(1) Set lookup)
-    if (gameState.usedWords.has(cleanedWord)) {
-      socket.emit('VALIDATION_ERROR', { message: "That word has already been used!" });
-      return;
-    }
-
-    // 3. Verify it exists inside the dictionary Set
+    // Check 2: Must be a valid English word in the dictionary
     if (!dictionarySet.has(cleanedWord)) {
-      socket.emit('VALIDATION_ERROR', { message: "Not a valid English word in dictionary." });
+      await message.reply("❌ Not a valid English word in the dictionary!");
       return;
     }
 
-    // Success!
-    gameState.usedWords.add(cleanedWord);
-    pickNewSyllable();
-    rotateTurn();
-    gameState.bombTimer = 15.0; // Reset timer to 15.0
-
-    io.emit('STATE_UPDATE', getSerializableGameState());
-  });
-
-  socket.on('disconnect', () => {
-    console.log(`Socket disconnected: ${socket.id}`);
-    const isTurnOwner = socket.id === gameState.turnOwner;
-
-    gameState.players.delete(socket.id);
-
-    if (isTurnOwner) {
-      rotateTurn();
-      gameState.bombTimer = 15.0;
+    // Check 3: Must not have been used already in this game round
+    if (usedWords.has(cleanedWord)) {
+      await message.reply("⚠️ That word has already been used in this game!");
+      return;
     }
 
-    io.emit('STATE_UPDATE', getSerializableGameState());
-  });
-});
-
-// 4. Secure HTTP POST route `/api/token` for OAuth2 Discord credential exchange
-app.post('/api/token', async (req, res) => {
-  const { code, redirect_uri } = req.body;
-
-  if (!code) {
-    return res.status(400).json({ error: "Missing authorization code" });
-  }
-
-  try {
-    const response = await fetch('https://discord.com/api/oauth2/token', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        client_id: process.env.VITE_CLIENT_ID || "",
-        client_secret: process.env.CLIENT_SECRET || "",
-        grant_type: 'authorization_code',
-        code: code,
-        redirect_uri: redirect_uri || "",
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error("Discord token exchange failed:", data);
-      return res.status(response.status).json(data);
+    // Success! Defuse the bomb
+    if (bombTimer) {
+      clearTimeout(bombTimer);
+      bombTimer = null;
     }
 
-    return res.json(data);
-  } catch (error) {
-    console.error("OAuth2 Token Exchange Proxy Error:", error);
-    return res.status(500).json({ error: "Internal server error during OAuth2 token exchange" });
+    // Mark as used
+    usedWords.add(cleanedWord);
+
+    // React with checkmark to signify defusal
+    try {
+      await message.react('✅');
+    } catch (err) {
+      console.error("Failed to add emoji reaction:", err.message);
+    }
+
+    // Next round setup
+    const nextPrompt = pickRandomSyllable();
+    await message.channel.send(`defused! Next prompt is: **"${nextPrompt}"**! Quick, 15 seconds!`);
+    
+    startRoundTimer(message.channel);
   }
 });
 
-// Root check route
-app.get('/', (req, res) => {
-  res.send('Discord BombParty Game Engine Server is running.');
-});
-
-server.listen(PORT, () => {
-  console.log(`BombParty game server listening on port ${PORT}`);
-});
+// Login using securely loaded token
+const token = process.env.DISCORD_TOKEN;
+if (token && token !== "YOUR_SECRET_TOKEN_HERE") {
+  client.login(token).catch(err => {
+    console.error("Discord Login failed:", err.message);
+  });
+} else {
+  console.warn("DISCORD_TOKEN is missing or not configured. Set your credentials in the environment or .env file.");
+}
